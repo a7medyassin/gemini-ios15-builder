@@ -1,0 +1,458 @@
+name: Build Gemini iOS 15 IPA
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - name: Build native Swift app (no Apple ID or API key in repository)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p Payload/Gemini.app
+          cat > Gemini.swift <<'SWIFT_CODE'
+          import SwiftUI
+          import Foundation
+          import UIKit
+          import PhotosUI
+          import UniformTypeIdentifiers
+          import Security
+          
+          private enum KeychainStore {
+              static let service = "local.gemini.ios15"
+              static let account = "gemini-api-key"
+          
+              static func read() -> String {
+                  let query: [String: Any] = [
+                      kSecClass as String: kSecClassGenericPassword,
+                      kSecAttrService as String: service,
+                      kSecAttrAccount as String: account,
+                      kSecReturnData as String: true,
+                      kSecMatchLimit as String: kSecMatchLimitOne
+                  ]
+                  var result: CFTypeRef?
+                  guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
+                        let data = result as? Data,
+                        let value = String(data: data, encoding: .utf8) else { return "" }
+                  return value
+              }
+          
+              static func save(_ value: String) {
+                  let query: [String: Any] = [
+                      kSecClass as String: kSecClassGenericPassword,
+                      kSecAttrService as String: service,
+                      kSecAttrAccount as String: account
+                  ]
+                  SecItemDelete(query as CFDictionary)
+                  guard !value.isEmpty, let data = value.data(using: .utf8) else { return }
+                  var attributes = query
+                  attributes[kSecValueData as String] = data
+                  attributes[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+                  SecItemAdd(attributes as CFDictionary, nil)
+              }
+          }
+          
+          private struct ChatMessage: Identifiable {
+              let id = UUID()
+              let role: String
+              let text: String
+          }
+          
+          private struct Attachment {
+              let name: String
+              let bytes: Data
+              let mime: String
+          }
+          
+          private struct GeminiService {
+              static func reply(apiKey: String,
+                                model: String,
+                                history: [ChatMessage],
+                                prompt: String,
+                                attachment: Attachment?,
+                                done: @escaping (Result<String, Error>) -> Void) {
+                  guard let safeModel = model.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed),
+                        let url = URL(string: "https://generativelanguage.googleapis.com/v1beta/models/\(safeModel):generateContent") else {
+                      done(.failure(ServiceError.message("اسم النموذج غير صالح")))
+                      return
+                  }
+          
+                  var contents: [[String: Any]] = history.suffix(12).map { message in
+                      ["role": message.role, "parts": [["text": message.text]]]
+                  }
+                  var parts: [[String: Any]] = []
+                  if !prompt.isEmpty { parts.append(["text": prompt]) }
+                  if let attachment = attachment {
+                      parts.append(["inline_data": [
+                          "mime_type": attachment.mime,
+                          "data": attachment.bytes.base64EncodedString()
+                      ]])
+                  }
+                  contents.append(["role": "user", "parts": parts])
+          
+                  let json: [String: Any] = ["contents": contents]
+                  guard let body = try? JSONSerialization.data(withJSONObject: json) else {
+                      done(.failure(ServiceError.message("تعذّر إنشاء الطلب")))
+                      return
+                  }
+                  var request = URLRequest(url: url)
+                  request.httpMethod = "POST"
+                  request.setValue(apiKey, forHTTPHeaderField: "x-goog-api-key")
+                  request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                  request.httpBody = body
+                  request.timeoutInterval = 90
+          
+                  URLSession.shared.dataTask(with: request) { data, response, error in
+                      if let error = error { done(.failure(error)); return }
+                      guard let data = data else {
+                          done(.failure(ServiceError.message("لم يصل رد من Google")))
+                          return
+                      }
+                      guard let decoded = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                          done(.failure(ServiceError.message("رد غير مفهوم من Google")))
+                          return
+                      }
+                      if let errorPayload = decoded["error"] as? [String: Any] {
+                          let message = errorPayload["message"] as? String ?? "API error"
+                          done(.failure(ServiceError.message(message)))
+                          return
+                      }
+                      let candidates = decoded["candidates"] as? [[String: Any]] ?? []
+                      let content = candidates.first?["content"] as? [String: Any]
+                      let answerParts = content?["parts"] as? [[String: Any]] ?? []
+                      let text = answerParts.compactMap { $0["text"] as? String }
+                                            .joined(separator: "\n")
+                                            .trimmingCharacters(in: .whitespacesAndNewlines)
+                      if text.isEmpty {
+                          let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+                          done(.failure(ServiceError.message("لا يوجد رد نصّي. HTTP \(code) — ربما المحتوى محظور أو النموذج غير متاح.")))
+                      } else {
+                          done(.success(text))
+                      }
+                  }.resume()
+              }
+          }
+          
+          private enum ServiceError: LocalizedError {
+              case message(String)
+              var errorDescription: String? {
+                  switch self { case .message(let message): return message }
+              }
+          }
+          
+          private struct PhotoLibraryPicker: UIViewControllerRepresentable {
+              let onPhoto: (UIImage) -> Void
+              let onCancel: () -> Void
+          
+              func makeUIViewController(context: Context) -> PHPickerViewController {
+                  var config = PHPickerConfiguration(photoLibrary: .shared())
+                  config.selectionLimit = 1
+                  config.filter = .images
+                  let picker = PHPickerViewController(configuration: config)
+                  picker.delegate = context.coordinator
+                  return picker
+              }
+              func updateUIViewController(_ controller: PHPickerViewController, context: Context) {}
+              func makeCoordinator() -> Coordinator { Coordinator(self) }
+          
+              final class Coordinator: NSObject, PHPickerViewControllerDelegate {
+                  let parent: PhotoLibraryPicker
+                  init(_ parent: PhotoLibraryPicker) { self.parent = parent }
+                  func picker(_ picker: PHPickerViewController, didFinishPicking results: [PHPickerResult]) {
+                      guard let provider = results.first?.itemProvider,
+                            provider.canLoadObject(ofClass: UIImage.self) else {
+                          DispatchQueue.main.async { self.parent.onCancel() }
+                          return
+                      }
+                      provider.loadObject(ofClass: UIImage.self) { object, _ in
+                          DispatchQueue.main.async {
+                              if let image = object as? UIImage { self.parent.onPhoto(image) }
+                              else { self.parent.onCancel() }
+                          }
+                      }
+                  }
+              }
+          }
+          
+          private struct ContentView: View {
+              @State private var apiKey = KeychainStore.read()
+              @State private var keyInput = ""
+              @State private var model = "gemini-3.8-flash"
+              @State private var showingSettings = false
+              @State private var showingPhotos = false
+              @State private var showingFiles = false
+              @State private var showingAttachmentMenu = false
+              @State private var messages: [ChatMessage] = []
+              @State private var prompt = ""
+              @State private var attachment: Attachment?
+              @State private var busy = false
+              @State private var errorText: String?
+          
+              var body: some View {
+                  NavigationView {
+                      VStack(spacing: 0) {
+                          ScrollViewReader { scroll in
+                              ScrollView {
+                                  LazyVStack(alignment: .leading, spacing: 13) {
+                                      if messages.isEmpty {
+                                          VStack(spacing: 12) {
+                                              Image(systemName: "sparkles")
+                                                  .font(.system(size: 50))
+                                                  .foregroundColor(.indigo)
+                                              Text("Gemini for iOS 15")
+                                                  .font(.title2.bold())
+                                              Text("محادثات وصور وملفات PDF باستخدام Gemini API")
+                                                  .font(.footnote)
+                                                  .foregroundColor(.secondary)
+                                                  .multilineTextAlignment(.center)
+                                              Text("هذا تطبيق مستقل وليس تطبيق Google الرسمي")
+                                                  .font(.caption)
+                                                  .foregroundColor(.secondary)
+                                          }
+                                          .frame(maxWidth: .infinity)
+                                          .padding(.top, 65)
+                                      }
+                                      ForEach(messages) { message in
+                                          HStack {
+                                              if message.role == "user" { Spacer(minLength: 38) }
+                                              Text(message.text)
+                                                  .font(.body)
+                                                  .textSelection(.enabled)
+                                                  .padding(12)
+                                                  .foregroundColor(message.role == "user" ? .white : .primary)
+                                                  .background(message.role == "user" ? Color.indigo : Color(UIColor.secondarySystemBackground))
+                                                  .cornerRadius(14)
+                                              if message.role != "user" { Spacer(minLength: 38) }
+                                          }
+                                          .id(message.id)
+                                      }
+                                      if busy {
+                                          HStack {
+                                              ProgressView()
+                                              Text("Gemini بيكتب...").font(.footnote)
+                                              Spacer()
+                                          }
+                                          .padding(.horizontal, 10)
+                                      }
+                                  }
+                                  .padding(16)
+                              }
+                              .onChange(of: messages.count) { _ in
+                                  if let last = messages.last {
+                                      withAnimation { scroll.scrollTo(last.id, anchor: .bottom) }
+                                  }
+                              }
+                          }
+          
+                          Divider()
+                          if let selected = attachment {
+                              HStack {
+                                  Image(systemName: "paperclip")
+                                  Text(selected.name).lineLimit(1)
+                                  Spacer()
+                                  Button { attachment = nil } label: { Image(systemName: "xmark.circle.fill") }
+                              }
+                              .font(.footnote)
+                              .padding(.horizontal, 16)
+                              .padding(.top, 8)
+                          }
+                          HStack(alignment: .bottom, spacing: 12) {
+                              Button { showingAttachmentMenu = true } label: {
+                                  Image(systemName: "plus.circle.fill")
+                                      .font(.system(size: 30))
+                                      .foregroundColor(.indigo)
+                              }
+                              .accessibilityLabel("إضافة صورة أو ملف PDF")
+          
+                              TextField("Ask Gemini", text: $prompt)
+                                  .textFieldStyle(RoundedBorderTextFieldStyle())
+                                  .font(.body)
+          
+                              Button(action: send) {
+                                  Image(systemName: "arrow.up.circle.fill")
+                                      .font(.system(size: 30))
+                              }
+                              .disabled(busy || (prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && attachment == nil))
+                          }
+                          .padding(12)
+                      }
+                      .navigationBarTitle("Gemini", displayMode: .inline)
+                      .navigationBarItems(trailing:
+                          Button { showingSettings = true } label: {
+                              Image(systemName: "gearshape.fill")
+                          }
+                      )
+                      .confirmationDialog("إضافة مرفق", isPresented: $showingAttachmentMenu) {
+                          Button("اختيار صورة من Photos") { showingPhotos = true }
+                          Button("اختيار صورة أو PDF من Files") { showingFiles = true }
+                          Button("إلغاء", role: .cancel) {}
+                      }
+                      .sheet(isPresented: $showingPhotos) {
+                          PhotoLibraryPicker(onPhoto: { image in
+                              showingPhotos = false
+                              let maxDimension: CGFloat = 1800
+                              let scale = min(1, maxDimension / max(image.size.width, image.size.height))
+                              let target = CGSize(width: image.size.width * scale, height: image.size.height * scale)
+                              let renderer = UIGraphicsImageRenderer(size: target)
+                              let reduced = renderer.image { _ in image.draw(in: CGRect(origin: .zero, size: target)) }
+                              if let data = reduced.jpegData(compressionQuality: 0.75) {
+                                  attachment = Attachment(name: "Photo.jpg", bytes: data, mime: "image/jpeg")
+                              } else { errorText = "تعذّر تجهيز الصورة" }
+                          }, onCancel: { showingPhotos = false })
+                      }
+                      .fileImporter(isPresented: $showingFiles, allowedContentTypes: [.pdf, .image]) { result in
+                          switch result {
+                          case .success(let url):
+                              let scoped = url.startAccessingSecurityScopedResource()
+                              defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+                              do {
+                                  let data = try Data(contentsOf: url)
+                                  guard data.count <= 10 * 1024 * 1024 else {
+                                      errorText = "اختار ملف أقل من 10MB"
+                                      return
+                                  }
+                                  let mime = UTType(filenameExtension: url.pathExtension)?.preferredMIMEType ?? "application/octet-stream"
+                                  guard mime.hasPrefix("image/") || mime == "application/pdf" else {
+                                      errorText = "الملفات المدعومة: صور وPDF فقط"
+                                      return
+                                  }
+                                  attachment = Attachment(name: url.lastPathComponent, bytes: data, mime: mime)
+                              } catch { errorText = error.localizedDescription }
+                          case .failure(let error):
+                              errorText = error.localizedDescription
+                          }
+                      }
+                      .sheet(isPresented: $showingSettings) {
+                          NavigationView {
+                              Form {
+                                  Section(header: Text("Gemini API Key")) {
+                                      SecureField("API Key", text: $keyInput)
+                                          .textContentType(.password)
+                                      Button("حفظ المفتاح على الجهاز") {
+                                          let trimmed = keyInput.trimmingCharacters(in: .whitespacesAndNewlines)
+                                          guard !trimmed.isEmpty else { return }
+                                          KeychainStore.save(trimmed)
+                                          apiKey = trimmed
+                                          keyInput = ""
+                                          showingSettings = false
+                                      }
+                                      Button("حذف المفتاح المحفوظ") {
+                                          KeychainStore.save("")
+                                          apiKey = ""
+                                          keyInput = ""
+                                      }
+                                      Text("المفتاح يظل داخل Keychain على الجهاز ولا يُضاف لمشروع GitHub. للاستخدام الشخصي فقط؛ التطبيقات المتصلة مباشرة بالـAPI ليست بديلاً عن خادم آمن.")
+                                          .font(.caption)
+                                  }
+                                  Section(header: Text("Model ID")) {
+                                      TextField("Model", text: $model)
+                                          .autocapitalization(.none)
+                                          .disableAutocorrection(true)
+                                  }
+                                  Section {
+                                      Button("مسح المحادثة") { messages.removeAll() }
+                                  }
+                              }
+                              .navigationBarTitle("الإعدادات", displayMode: .inline)
+                              .navigationBarItems(trailing: Button("تم") { showingSettings = false })
+                          }
+                      }
+                      .alert(isPresented: Binding(get: { errorText != nil }, set: { if !$0 { errorText = nil } })) {
+                          Alert(title: Text("تنبيه"), message: Text(errorText ?? ""), dismissButton: .default(Text("حسنًا")))
+                      }
+                      .onAppear {
+                          if apiKey.isEmpty { showingSettings = true }
+                      }
+                  }
+              }
+          
+              private func send() {
+                  if apiKey.isEmpty {
+                      showingSettings = true
+                      return
+                  }
+                  let message = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+                  let chosen = attachment
+                  let previous = messages
+                  messages.append(ChatMessage(role: "user", text: message.isEmpty ? "📎 \(chosen?.name ?? "مرفق")" : message + (chosen == nil ? "" : "\n📎 \(chosen!.name)")))
+                  prompt = ""
+                  attachment = nil
+                  busy = true
+                  GeminiService.reply(apiKey: apiKey, model: model, history: previous,
+                                      prompt: message.isEmpty ? "حلّل المرفق المرفق." : message,
+                                      attachment: chosen) { result in
+                      DispatchQueue.main.async {
+                          busy = false
+                          switch result {
+                          case .success(let text): messages.append(ChatMessage(role: "model", text: text))
+                          case .failure(let error): errorText = error.localizedDescription
+                          }
+                      }
+                  }
+              }
+          }
+          
+          @main
+          struct GeminiIOS15App: App {
+              var body: some Scene {
+                  WindowGroup { ContentView() }
+              }
+          }
+          SWIFT_CODE
+          cat > Payload/Gemini.app/Info.plist <<'INFO_PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleDevelopmentRegion</key><string>en</string>
+            <key>CFBundleDisplayName</key><string>Gemini</string>
+            <key>CFBundleExecutable</key><string>Gemini</string>
+            <key>CFBundleIdentifier</key><string>com.personal.gemini.ios15</string>
+            <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+            <key>CFBundleName</key><string>Gemini</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleShortVersionString</key><string>1.0.0</string>
+            <key>CFBundleVersion</key><string>1</string>
+            <key>LSRequiresIPhoneOS</key><true/>
+            <key>MinimumOSVersion</key><string>15.0</string>
+            <key>UIDeviceFamily</key><array><integer>1</integer></array>
+            <key>UISupportedInterfaceOrientations</key>
+            <array>
+              <string>UIInterfaceOrientationPortrait</string>
+              <string>UIInterfaceOrientationLandscapeLeft</string>
+              <string>UIInterfaceOrientationLandscapeRight</string>
+            </array>
+            <key>UILaunchScreen</key><dict/>
+            <key>NSAppTransportSecurity</key>
+            <dict><key>NSAllowsArbitraryLoads</key><false/></dict>
+          </dict>
+          </plist>
+          INFO_PLIST
+          xcrun --version
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          xcrun --sdk iphoneos swiftc \
+            -sdk "$SDK" \
+            -target arm64-apple-ios15.0 \
+            -parse-as-library -O \
+            -framework SwiftUI -framework UIKit -framework PhotosUI \
+            -framework UniformTypeIdentifiers -framework Security \
+            Gemini.swift -o Payload/Gemini.app/Gemini
+          chmod 755 Payload/Gemini.app/Gemini
+          plutil -lint Payload/Gemini.app/Info.plist
+          codesign --force --sign - --timestamp=none Payload/Gemini.app
+          zip -q -r Gemini.ipa Payload
+          file Payload/Gemini.app/Gemini
+          ls -lh Gemini.ipa
+      - name: Upload TrollStore IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: Gemini-iOS15-TrollStore
+          path: Gemini.ipa
+          if-no-files-found: error
+          retention-days: 7
